@@ -246,39 +246,46 @@ class TransFusionHead(nn.Module):
 
     forward_single：核心特征处理与预测（关键！）
     作用：单尺度 LiDAR BEV 特征→Transformer 优化→候选框预测，是从输入到预测的核心流程。
+    这个并不是指的lidar特征 而是融合特征 经过解码器生成的特征内容 映射到512通道接收
     def forward_single(self, inputs, img_inputs, metas):
         """Forward function for CenterPoint.
-        Args:
+        Args: 输入张量  形式  批次 512通道  128宽高比
             inputs (torch.Tensor): Input feature map with the shape of
                 [B, 512, 128(H), 128(W)]. (consistent with L748)
-        Returns:
+        Returns: 返回的是列表（列表里面是字典）  针对于各个任务的输出结果
             list[dict]: Output results for tasks.
         """
-        batch_size = inputs.shape[0]
-        lidar_feat = self.shared_conv(inputs)
+        batch_size = inputs.shape[0]  读取批次大小
+        lidar_feat = self.shared_conv(inputs)   对特征进行卷积操作
 
         #################################
-        # image to BEV
+        # image to BEV # 步骤 1：LiDAR 特征预处理
         #################################
+         # 展平特征（适配 Transformer 输入：[B, C, N]，N=H*W）
         lidar_feat_flatten = lidar_feat.view(
             batch_size, lidar_feat.shape[1], -1
-        )  # [BS, C, H*W]
+        )  # [BS, C, H*W]  将特征进行战平  批次  通道  宽高乘积特征总数
+         # BEV 位置嵌入重复到 batch 大小（[1, N, 2] → [B, N, 2]）
         bev_pos = self.bev_pos.repeat(batch_size, 1, 1).to(lidar_feat.device)
 
         #################################
-        # image guided query initialization
+        # image guided query initialization# 步骤 2：图像引导候选框初始化（实际用 LiDAR 热力图）
         #################################
+         # 1. 生成 dense 热力图（预测每个 BEV 位置的类别分数）
         dense_heatmap = self.heatmap_head(lidar_feat)
         dense_heatmap_img = None
+         # 2. 热力图 sigmoid（转成概率）+ 局部极大值抑制（NMS）→ 筛选候选框中心
         heatmap = dense_heatmap.detach().sigmoid()
-        padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(heatmap)
+        padding = self.nms_kernel_size // 2 # NMS 核padding（如核大小 3→padding=1）
+        local_max = torch.zeros_like(heatmap)  # 存储局部极大值
+        
+        # 局部极大值池化（仅保留每个窗口的最大值，抑制相邻重复候选框）
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
         local_max_inner = F.max_pool2d(
             heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0
         )
-        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner
-        ## for Pedestrian & Traffic_cone in nuScenes
+        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner  # 填充回原尺寸
+        ## for Pedestrian & Traffic_cone in nuScenes  # 特殊处理小目标（行人、交通锥等）：核大小 1（不做池化，保留更多候选框）
         if self.test_cfg["dataset"] == "nuScenes":
             local_max[
                 :,
@@ -297,30 +304,40 @@ class TransFusionHead(nn.Module):
                 :,
                 2,
             ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
+        # 只保留热力图中等于局部极大值的位置（过滤非峰值）
         heatmap = heatmap * (heatmap == local_max)
+        # 展平热力图（方便后续选 top-k）
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
 
         # top #num_proposals among all classes
+     # 3. 选 top-num_proposals 个候选框（跨所有类别选分数最高的）
         top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
             ..., : self.num_proposals
         ]
-        top_proposals_class = top_proposals // heatmap.shape[-1]
-        top_proposals_index = top_proposals % heatmap.shape[-1]
+         # 解析候选框的类别和 BEV 索引（H*W 中的位置）
+        top_proposals_class = top_proposals // heatmap.shape[-1]            # [B, 128]（类别索引：0~num_classes-1）
+        top_proposals_index = top_proposals % heatmap.shape[-1]            # [B, 128]（BEV 展平后的索引：0~16383）
+
+         # 4. 构建候选框特征（query_feat）：从 LiDAR 特征中提取候选框位置的特征
         query_feat = lidar_feat_flatten.gather(
             index=top_proposals_index[:, None, :].expand(
                 -1, lidar_feat_flatten.shape[1], -1
             ),
             dim=-1,
         )
-        self.query_labels = top_proposals_class
+        self.query_labels = top_proposals_class            # 保存候选框类别（后续用于分数计算）
 
         # add category embedding
+         # one-hot 编码候选框类别：[B, 128] → [B, 128, num_classes] → 转置为 [B, num_classes, 128]
         one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(
             0, 2, 1
         )
+        # 类别嵌入：[B, num_classes, 128] → [B, hidden_channel, 128]（Conv1d 压缩通道）
         query_cat_encoding = self.class_encoding(one_hot.float())
-        query_feat += query_cat_encoding
+        query_feat += query_cat_encoding# 特征融合（类别信息 + LiDAR 特征）
 
+
+         # 6. 构建候选框位置嵌入（query_pos）：从 BEV 位置嵌入中提取候选框位置
         query_pos = bev_pos.gather(
             index=top_proposals_index[:, None, :]
             .permute(0, 2, 1)
@@ -329,66 +346,91 @@ class TransFusionHead(nn.Module):
         )
 
         #################################
-        # transformer decoder layer (LiDAR feature as K,V)
+        # transformer decoder layer (LiDAR feature as K,V) # 步骤 3：Transformer 解码器迭代优化候选框
         #################################
-        ret_dicts = []
+        ret_dicts = []# 存储每个解码器层的预测结果
         for i in range(self.num_decoder_layers):
             prefix = "last_" if (i == self.num_decoder_layers - 1) else f"{i}head_"
 
             # Transformer Decoder Layer
             # :param query: B C Pq    :param query_pos: B Pq 3/6
+             # 1. Transformer 解码器层（核心：用 LiDAR 特征优化候选框特征）
+            # 输入：Q=query_feat [B,C,P], K/V=lidar_feat_flatten [B,C,N], Q_pos=query_pos [B,P,2], K_pos=bev_pos [B,N,2]
+            # 输出：更新后的 query_feat [B,C,P]（候选框特征更精准）
+            
             query_feat = self.decoder[i](
                 query_feat, lidar_feat_flatten, query_pos, bev_pos
             )
 
-            # Prediction
+            # Prediction # 2. 预测框参数（center/height/dim/rot/heatmap）
             res_layer = self.prediction_heads[i](query_feat)
+             # 修正 center：预测的是偏移量，需加上原始 query_pos（得到绝对坐标）
             res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
             first_res_layer = res_layer
             ret_dicts.append(res_layer)
 
-            # for next level positional embedding
+            # for next level positional embedding# 3. 更新下一层的位置嵌入（用当前层预测的 center 作为下一层的 query_pos，迭代优化）
             query_pos = res_layer["center"].detach().clone().permute(0, 2, 1)
 
         #################################
-        # transformer decoder layer (img feature as K,V)
+        # transformer decoder layer (img feature as K,V)  # 步骤 4：补充预测信息（热力图分数、dense 热力图）
         #################################
+         # 候选框的热力图分数（从 dense 热力图中提取）
         ret_dicts[0]["query_heatmap_score"] = heatmap.gather(
             index=top_proposals_index[:, None, :].expand(-1, self.num_classes, -1),
             dim=-1,
         )  # [bs, num_classes, num_proposals]
-        ret_dicts[0]["dense_heatmap"] = dense_heatmap
+        ret_dicts[0]["dense_heatmap"] = dense_heatmap # 保存 dense 热力图（用于计算热力图损失）
 
+
+         # 步骤 5：整理输出（是否返回所有层的预测）
         if self.auxiliary is False:
             # only return the results of last decoder layer
-            return [ret_dicts[-1]]
+            return [ret_dicts[-1]]# 仅返回最后一层（最优预测）
 
+            # 若用辅助监督：拼接所有层的预测（同一参数在 num_proposals 维度拼接）
         # return all the layer's results for auxiliary superivison
         new_res = {}
         for key in ret_dicts[0].keys():
-            if key not in ["dense_heatmap", "dense_heatmap_old", "query_heatmap_score"]:
+            if key not in ["dense_heatmap", "dense_heatmap_old", "query_heatmap_score"]:# 不拼接特殊键
                 new_res[key] = torch.cat(
                     [ret_dict[key] for ret_dict in ret_dicts], dim=-1
                 )
             else:
-                new_res[key] = ret_dicts[0][key]
+                new_res[key] = ret_dicts[0][key]# 保留第一层的特殊键
         return [new_res]
 
     1. forward：入口函数
     作用：接收多尺度特征（本代码只支持单尺度），调用 forward_single 处理，返回预测结果。
     def forward(self, feats, metas):
+
+
+        
         """Forward pass.
-        Args:
+        Args: #args指的是参数  输入的是特征  以列表形式存储的张量 多尺度特征  “多尺度特征”（如 FPN 输出的不同分辨率特征图），所以用列表包裹多个张量，每个张量对应一个尺度。
             feats (list[torch.Tensor]): Multi-level features, e.g.,
                 features produced by FPN.
-        Returns:
+        Returns: #返回值  返回元组 嵌套 列表  内部 字典
+        最外层元组：若输入feats有 2 个尺度（level 0 和 level 1），则元组长度为 2。
+        中间层列表：网络层（layer）” 划分，每个元素对应模型中一层的输出（如 Transformer 解码器的多层输出）。例如，若解码器有 3 层，则每个list长度为 3。
+        内层字典：存储具体的预测结果，键值对通常包含检测任务的核心信息，例如：
+                bboxes_3d：3D 边界框坐标（如 x/y/z/w/l/h/ 旋转角）；
+                scores：预测框的置信度（0~1 之间，值越高越可信）；
+                labels_3d：目标类别标签（如 “car”“pedestrian” 对应的数字编码）
+                
             tuple(list[dict]): Output results. first index by level, second index by layer
         """
+
+        # 若输入 feats 是张量（单尺度），转成列表（适配 multi_apply 的多尺度输入）
         if isinstance(feats, torch.Tensor):
             feats = [feats]
+            
+        # multi_apply：对每个尺度的 feats，调用 forward_single
+        # 参数：forward_single, feats（每个元素是单尺度特征）, [None]（img_inputs 预留）, [metas]（元信息）
+        
         res = multi_apply(self.forward_single, feats, [None], [metas])
-        assert len(res) == 1, "only support one level features."
-        return res
+        assert len(res) == 1, "only support one level features." ## 仅支持单尺度
+        return res  ## res[0] 是 forward_single 的输出（预测结果）
 
 
     1. get_targets：生成训练目标（GT 分配给预测）
@@ -409,15 +451,19 @@ class TransFusionHead(nn.Module):
         """
         # change preds_dict into list of dict (index by batch_id)
         # preds_dict[0]['center'].shape [bs, 3, num_proposal]
+
+
+         步骤 1：将 preds_dict 按 batch 拆分（每个样本一个预测字典）
         list_of_pred_dict = []
         for batch_idx in range(len(gt_bboxes_3d)):
             pred_dict = {}
             for key in preds_dict[0].keys():
-                pred_dict[key] = preds_dict[0][key][batch_idx : batch_idx + 1]
+                pred_dict[key] = preds_dict[0][key][batch_idx : batch_idx + 1]# 取单个样本的预测
             list_of_pred_dict.append(pred_dict)
 
         assert len(gt_bboxes_3d) == len(list_of_pred_dict)
 
+         # 步骤 2：对每个样本调用 get_targets_single，生成目标
         res_tuple = multi_apply(
             self.get_targets_single,
             gt_bboxes_3d,
@@ -425,14 +471,16 @@ class TransFusionHead(nn.Module):
             list_of_pred_dict,
             np.arange(len(gt_labels_3d)),
         )
-        labels = torch.cat(res_tuple[0], dim=0)
-        label_weights = torch.cat(res_tuple[1], dim=0)
-        bbox_targets = torch.cat(res_tuple[2], dim=0)
-        bbox_weights = torch.cat(res_tuple[3], dim=0)
-        ious = torch.cat(res_tuple[4], dim=0)
-        num_pos = np.sum(res_tuple[5])
-        matched_ious = np.mean(res_tuple[6])
-        heatmap = torch.cat(res_tuple[7], dim=0)
+
+          # 步骤 3：拼接所有样本的目标（批量返回）
+        labels = torch.cat(res_tuple[0], dim=0)          # [B×P, ]（类别标签）
+        label_weights = torch.cat(res_tuple[1], dim=0)   # [B×P, ]（类别损失权重）
+        bbox_targets = torch.cat(res_tuple[2], dim=0)    # [B×P, code_size]（box 回归目标）
+        bbox_weights = torch.cat(res_tuple[3], dim=0)    # [B×P, code_size]（box 损失权重）
+        ious = torch.cat(res_tuple[4], dim=0)            # [B×P, ]（预测框与 GT 的 IOU）
+        num_pos = np.sum(res_tuple[5])                   # 正样本总数
+        matched_ious = np.mean(res_tuple[6])             # 正样本平均 IOU（监控用）
+        heatmap = torch.cat(res_tuple[7], dim=0)         # [B, num_classes, H, W]（热力图 GT）
         return (
             labels,
             label_weights,
@@ -442,7 +490,7 @@ class TransFusionHead(nn.Module):
             num_pos,
             matched_ious,
             heatmap,
-        )
+        )#返回结果内容
 
 
     get_targets_single：生成单个样本的训练目标（关键！）
@@ -464,14 +512,14 @@ class TransFusionHead(nn.Module):
                 - int: number of positive proposals
         """
         num_proposals = preds_dict["center"].shape[-1]
-
+         # 步骤 1：解码预测框（将模型输出的参数→真实世界 3D 框）
         # get pred boxes, carefully ! donot change the network outputs
-        score = copy.deepcopy(preds_dict["heatmap"].detach())
-        center = copy.deepcopy(preds_dict["center"].detach())
-        height = copy.deepcopy(preds_dict["height"].detach())
-        dim = copy.deepcopy(preds_dict["dim"].detach())
-        rot = copy.deepcopy(preds_dict["rot"].detach())
-        if "vel" in preds_dict.keys():
+        score = copy.deepcopy(preds_dict["heatmap"].detach())    # [1, num_classes, P]
+        center = copy.deepcopy(preds_dict["center"].detach())    # [1, 2, P]（BEV 中心 x/y）
+        height = copy.deepcopy(preds_dict["height"].detach())    # [1, 1, P]（高度 z）
+        dim = copy.deepcopy(preds_dict["dim"].detach())          # [1, 3, P]（尺寸 w/l/h）
+        rot = copy.deepcopy(preds_dict["rot"].detach())          # [1, 2, P]（旋转角 sin/cos）
+        if "vel" in preds_dict.keys():        ## 速度（预留）
             vel = copy.deepcopy(preds_dict["vel"].detach())
         else:
             vel = None
