@@ -28,22 +28,22 @@ from mmcv.cnn import ConvModule, build_conv_layer
 from mmcv.runner import force_fp32
 from torch import nn
 
-from mmdet3d.core import (
-    PseudoSampler,
-    circle_nms,
-    draw_heatmap_gaussian,
-    gaussian_radius,
-    xywhr2xyxyr,
+from mmdet3d.core import ( # mmdet3d的核心功能
+    PseudoSampler, # 伪采样器
+    circle_nms,  # 圆形NMS
+    draw_heatmap_gaussian, # 绘制高斯热力图
+    gaussian_radius, # 计算高斯半径
+    xywhr2xyxyr,    # 坐标转换
 )
-from mmdet3d.models.builder import HEADS, build_loss
+from mmdet3d.models.builder import HEADS, build_loss # 注册器和损失函数构建
 from mmdet3d.models.utils import FFN, PositionEmbeddingLearned, TransformerDecoderLayer
 from mmdet3d.ops.iou3d.iou3d_utils import nms_gpu
-from mmdet.core import (
-    AssignResult,
-    build_assigner,
-    build_bbox_coder,
-    build_sampler,
-    multi_apply,
+from mmdet.core import (  # mmdet的核心功能
+    AssignResult,# 分配结果
+    build_assigner,  # 构建分配器
+    build_bbox_coder,  # 构建边界框编码器
+    build_sampler,  # 构建采样器
+    multi_apply,  # 多元素应用函数
 )
 
 __all__ = ["TransFusionHead"]
@@ -52,7 +52,7 @@ __all__ = ["TransFusionHead"]
 def clip_sigmoid(x, eps=1e-4):
     y = torch.clamp(x.sigmoid_(), min=eps, max=1 - eps)
     return y
-
+定义了一个截断的 sigmoid 函数，将输出限制在 [eps, 1-eps] 范围内，避免数值极端值影响后续计算。
 
 @HEADS.register_module()
 class TransFusionHead(nn.Module):
@@ -62,9 +62,10 @@ class TransFusionHead(nn.Module):
         num_proposals=128,每个解码器层输出的候选框数量
         auxiliary=True,是否使用「辅助监督」（即对所有解码器层计算损失，而非仅最后一层）
         in_channels=128 * 3,输入 BEV 特征图的通道数
-        hidden_channel=128,
+        hidden_channel=128, #
         num_classes=4,
         # config for Transformer
+        # Transformer配置
         num_decoder_layers=3,
         num_heads=8,
         nms_kernel_size=1,
@@ -73,28 +74,30 @@ class TransFusionHead(nn.Module):
         bn_momentum=0.1,
         activation="relu",
         # config for FFN
+        # FFN配置
         common_heads=dict(),
         num_heatmap_convs=2,
         conv_cfg=dict(type="Conv1d"),
         norm_cfg=dict(type="BN1d"),
         bias="auto",
         # loss
-        loss_cls=dict(type="GaussianFocalLoss", reduction="mean"),
+        # 损失函数配置
+        loss_cls=dict(type="GaussianFocalLoss", reduction="mean"), # 分类损失
         loss_iou=dict(
             type="VarifocalLoss", use_sigmoid=True, iou_weighted=True, reduction="mean"
-        ),
-        loss_bbox=dict(type="L1Loss", reduction="mean"),
-        loss_heatmap=dict(type="GaussianFocalLoss", reduction="mean"),
+        ),# IoU损失
+        loss_bbox=dict(type="L1Loss", reduction="mean"),  # 边界框损失
+        loss_heatmap=dict(type="GaussianFocalLoss", reduction="mean"), # 热力图损失
         # others
-        train_cfg=None,
-        test_cfg=None,
-        bbox_coder=None,
+        train_cfg=None, #训练配置
+        test_cfg=None,#测试配置
+        bbox_coder=None,#边界框编码器
     ):
-        super(TransFusionHead, self).__init__()
+        super(TransFusionHead, self).__init__()# 调用父类构造函数
         #以下是利用传递配置信息 进行相关网络参数的初始化操作
 
         self.fp16_enabled = False
-
+        ## 保存基本参数  保存init中传递的一些基本参数 到模型中 记忆下来
         self.num_classes = num_classes
         self.num_proposals = num_proposals
         self.auxiliary = auxiliary
@@ -124,8 +127,8 @@ class TransFusionHead(nn.Module):
 
 
          特征处理层初始化（BEV 特征预处理）
-         包含「共享卷积」和「热力图头」，用于对输入的 LiDAR BEV 特征进行压缩和初步检测（生成候选框初始化的热力图）：
-         # 3. 共享卷积（压缩 LiDAR BEV 特征通道，如 384→128）
+         定义共享卷积层，用于压缩输入 BEV 特征的通道数，减少计算量。
+         # 3. 共享卷积（压缩  BEV 特征通道，如 512→128）
         # a shared convolution
         self.shared_conv = build_conv_layer(
             dict(type="Conv2d"), # 卷积类型（2D 卷积，适配 BEV 特征）
@@ -161,17 +164,19 @@ class TransFusionHead(nn.Module):
                 bias=bias,
             )
         )
-         # 4. 热力图头部（生成类别热力图，用于初始化候选框） 热力图头（heatmap_head）：生成候选框初始化热力图
+         #  4. 热力图头部（生成类别热力图，用于初始化候选框）
         self.heatmap_head = nn.Sequential(*layers)  # 串联两层，形成热力图头
+
+
          # 5. 类别嵌入（将候选框的类别信息编码为特征，融入 query）
         候选框的类别信息（如 “汽车”“行人”）需编码为特征，融入 Transformer 的输入 query_feat，
         让模型利用类别信息优化候选框。通过 1D 卷积将 one-hot 类别编码（num_classes 通道）压缩到 hidden_channel
         self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
 
 
-        # 6. Transformer 解码器（LiDAR 特征作为 K/V，候选框特征作为 Q）
+        # 6. Transformer 解码器（bev序列特征特征作为 K/V，候选框特征作为 Q）
         TransFusion 的核心是用 Transformer 迭代优化候选框
-        解码器以 BEV 特征为 K/V，候选框特征为 Q，通过注意力机制捕捉空间依赖，提升候选框精度。
+        解码器以 BEV 序列特征为 K/V，候选框特征为 Q，通过注意力机制捕捉空间依赖，提升候选框精度。
         解码器由 num_decoder_layers 个 TransformerDecoderLayer 组成（默认 3 层），每层包含：
         
         自注意力（Self-Attention）：优化候选框之间的关系；
@@ -180,10 +185,14 @@ class TransFusionHead(nn.Module):
         位置嵌入（Position Embedding）：提供空间位置信息，避免注意力无序。
 
         # transformer decoder layers for object query with LiDAR feature
+        #Transformer解码器（LiDAR特征作为K/V，候选框特征作为Q）
         self.decoder = nn.ModuleList()
         for i in range(self.num_decoder_layers):
             self.decoder.append(
-                TransformerDecoderLayer(
+                #这里是定义的  这个解码器是3个解码器层构成  而解码器层是已经写好的内容   是mmdet3d中的架构中导入进来的
+                # 解码器层接收上面传递的一些参数  直接构造而成
+                # 构建 Transformer 解码器，由多个解码器层组成，使用 LiDAR 特征作为键 (K) 和值 (V)，候选框特征作为查询 (Q)。
+                TransformerDecoderLayer(  
                     hidden_channel,
                     num_heads,
                     ffn_channel,
@@ -198,7 +207,7 @@ class TransFusionHead(nn.Module):
         # 7. 预测头部（每个解码器层输出后，预测 box 参数：center/height/dim/rot/heatmap）
         每个 Transformer 解码器层对应一个预测头，通过 FFN（前馈网络） 将解码器输出的候选框特征
         映射为具体的检测参数（如中心、尺寸、旋转角、热力图分数）
-        # Prediction Head
+        # Prediction Head  定义预测头
         self.prediction_heads = nn.ModuleList()
         for i in range(self.num_decoder_layers):
             heads = copy.deepcopy(common_heads)
@@ -225,12 +234,8 @@ class TransFusionHead(nn.Module):
         self._init_assigner_sampler()
 
 
-         # 9. BEV 位置嵌入（预生成网格坐标，用于 Cross-Attention）
-        预生成 BEV 平面的均匀网格坐标（尺寸 [1, H*W, 2]，H/W 为 BEV 特征图尺寸）
-        用于 Transformer 交叉注意力，让模型知道每个 BEV 位置的空间关系：
-
-        # Position Embedding for Cross-Attention, which is re-used during training
-        # 计算 BEV 特征图尺寸（由测试配置的网格大小和下采样因子决定）
+        # 9. BEV位置嵌入（预生成网格坐标，用于Cross-Attention）
+        # 预生成 BEV 平面的网格坐标，用于 Transformer 的交叉注意力机制，提供空间位置信息
         x_size = self.test_cfg["grid_size"][0] // self.test_cfg["out_size_factor"]
         y_size = self.test_cfg["grid_size"][1] // self.test_cfg["out_size_factor"]
         # 生成 2D 网格坐标（x/y 坐标）
@@ -242,7 +247,7 @@ class TransFusionHead(nn.Module):
 
 
     create_2D_grid：生成 BEV 网格位置嵌入
-    作用：生成 BEV 平面的均匀网格坐标，用于 Transformer 的位置嵌入（捕捉空间关系）。
+    生成 BEV 平面的均匀网格坐标，用于 Transformer 的位置嵌入，帮助模型理解空间关系。
     def create_2D_grid(self, x_size, y_size):
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         # NOTE: modified
@@ -268,8 +273,8 @@ class TransFusionHead(nn.Module):
         self.init_bn_momentum()
 
 
-    init_bn_momentum：设置 BN 层动量
-    作用：统一所有 BN 层的动量（控制历史均值 / 方差的更新速度），确保训练一致性。
+    # init_bn_momentum：设置 BN 层动量
+    # 作用：统一所有 BN 层的动量（控制历史均值 / 方差的更新速度），确保训练一致性。
     def init_bn_momentum(self):
         for m in self.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
@@ -295,9 +300,12 @@ class TransFusionHead(nn.Module):
             ]
 
     forward_single：核心特征处理与预测（关键！）
-    作用：单尺度 LiDAR BEV 特征→Transformer 优化→候选框预测，是从输入到预测的核心流程。
+    作用：单尺度 BEV 特征→Transformer 优化→候选框预测，是从输入到预测的核心流程。
     这个并不是指的lidar特征 而是融合特征 经过解码器生成的特征内容 映射到512通道接收
     def forward_single(self, inputs, img_inputs, metas):
+
+
+        
         """Forward function for CenterPoint.
         Args: 输入张量  形式  批次 512通道  128宽高比
             inputs (torch.Tensor): Input feature map with the shape of
@@ -305,9 +313,11 @@ class TransFusionHead(nn.Module):
         Returns: 返回的是列表（列表里面是字典）  针对于各个任务的输出结果
             list[dict]: Output results for tasks.
         """
-        batch_size = inputs.shape[0]  读取批次大小
-        lidar_feat = self.shared_conv(inputs)   对特征进行卷积操作
 
+        batch_size = inputs.shape[0]  #读取批次大小
+        lidar_feat = self.shared_conv(inputs)   #对特征进行共享卷积操作
+
+        
         #################################
         # image to BEV # 步骤 1：LiDAR 特征预处理
         #################################
@@ -316,11 +326,15 @@ class TransFusionHead(nn.Module):
         展平方式：按行优先（row-major）展开，即第 (i,j) 个网格点对应序列索引 i×180 + j（i 是行索引，j 是列索引）。
         例：(0,0) → 0，(0,1) → 1，…，(0,179) → 179，(1,0) → 180，…，(179,179) → 32399（180×180-1）。
         形状变化：[4,128,180,180] → [4,128,32400]（32400=180×180）。
+
+
         lidar_feat_flatten = lidar_feat.view(
             batch_size, lidar_feat.shape[1], -1
         )  
 
 
+
+        
         #BEV 位置嵌入（bev_pos）的生成逻辑
         作用：为每个 BEV 网格点添加空间坐标信息（x/y），让 Transformer 知道「这个特征在鸟瞰图的哪个位置」。
         作用：为每个 BEV 网格点添加空间坐标信息（x/y），让 Transformer 知道「这个特征在鸟瞰图的哪个位置」。
@@ -331,12 +345,14 @@ class TransFusionHead(nn.Module):
         
         bev_pos = self.bev_pos.repeat(batch_size, 1, 1).to(lidar_feat.device)
 
+
+
+        
         #################################
-        # image guided query initialization# 步骤 2：图像引导候选框初始化（实际用 LiDAR 热力图）
+        # image guided query initialization# 
         #################################
          # 1. 生成 dense 热力图（预测每个 BEV 位置的类别分数）
         # #候选框进行初始化
-        # 1. 热力图生成（heatmap_head）的细节
         # 作用：预测每个 BEV 网格点属于每个类别的概率（如网格 (i,j) 是「汽车」的概率）。
         # 网络结构：2 层卷积（Conv2d+BN2d → Conv2d）：
         # 第一层：128→128 通道（3×3 卷积，padding=1），加 BN 和 ReLU，增强特征表达；
@@ -351,7 +367,14 @@ class TransFusionHead(nn.Module):
         （若全优化，Transformer 注意力计算量会是筛选后 128 个候选框的 253 倍）
         是 “效率提升的关键一步”
 
-        dense_heatmap = self.heatmap_head(lidar_feat)
+
+
+         # 生成dense热力图（预测每个BEV位置的类别分数）
+        #输入bev特征  通过两个层  得到热力图
+        # 通过heatmap_head（由两层卷积组成）生成类别热力图（dense_heatmap），其形状为(batch_size, num_classes, H, W)，每个通道对应一个类别的分数图：
+        # 热力图的作用是初步定位目标中心并关联类别
+   
+        dense_heatmap = self.heatmap_head(lidar_feat)  #得到热力图[4,128,180,180] → [4,10,180,180]
         dense_heatmap_img = None
 
 
@@ -359,30 +382,38 @@ class TransFusionHead(nn.Module):
         
         热力图预处理：去重 + 归一化（确保候选框唯一）
         方法 1：sigmoid 激活
-        对热力图分数做sigmoid变换：heatmap = dense_heatmap.sigmoid()，将分数压缩到[0,1]区间。
-        原理：避免原始分数过大导致后续排序 “两极分化”（有的分数几万，有的几分），同时让分数具备 “概率意义”（0 = 无目标，1 = 有目标），便于后续筛选阈值设定。
-        方法 2：局部 NMS（非极大值抑制）
-        解决 “同一目标对应多个高分数网格” 的问题（如汽车中心周围 3×3 网格分数均高），仅保留局部峰值：    
-        local_max_inner = F.max_pool2d(heatmap, 3, 1, 0) → 形状 [4,10,178,178]（边缘各少 1 行 / 列）；
-        填充回原尺寸：在 local_max（初始全 0，[4,10,180,180]）的 [...,1:179,1:179] 区域填入 local_max_inner，得到「局部最大值掩码」；
-        过滤非峰值：仅保留 heatmap == local_max 的位置（非峰值置 0）。
-        效果：每个 3×3 窗口内只有 1 个峰值，避免相邻重复候选框。
-        heatmap = dense_heatmap.detach().sigmoid()
+        heatmap = dense_heatmap.detach().sigmoid()  经 sigmoid 激活后，分数转换为 “概率”，便于后续筛选   
         padding = self.nms_kernel_size // 2 # NMS 核padding（如核大小 3→padding=1）
-        local_max = torch.zeros_like(heatmap)  # 存储局部极大值
+        local_max = torch.zeros_like(heatmap)  # 创建一个与原始热图形状、属性完全一致的零张量，用于后续存储 “局部最大值” 结果   
+        
+        #所有元素初始为 0。
+        #         torch.zeros_like(input) 是 PyTorch 中的一个张量创建函数，作用是：
+        # 生成一个新张量，其形状（shape）、数据类型（dtype）、设备（device，如 CPU/GPU） 与输入张量（这里是heatmap）完全一致
+
         
         # 局部极大值池化（仅保留每个窗口的最大值，抑制相邻重复候选框）
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
         local_max_inner = F.max_pool2d(
             heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0
         )
-        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner  # 填充回原尺寸
-        ## for Pedestrian & Traffic_cone in nuScenes  # 特殊处理小目标（行人、交通锥等）：核大小 1（不做池化，保留更多候选框）
+        # 为热图上的每个位置找到其 “局部区域内的最大值”，为后续筛选真实目标中心做准备
+        #nms_kernel_size：局部 NMS 的核大小（如 3x3），表示 “以当前位置为中心，检查周围 3x3 区域内的最大值”；
+        #核越大，抑制的范围越广（适合大目标）；核越小，保留的细节越多（适合小目标）。
+        # 填充边缘（避免池化后边缘位置丢失）
+        # local_max_inner 的计算正是为了找到这些 “局部最高分”，后续通过 
+        # local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner 将其填充到与原始热图同尺寸的 local_max 中
+        
+        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner  # 填充回原尺寸位置
+
+        
+        ## for Pedestrian & Traffic_cone in nuScenes  # 特殊处理小目标（行人、交通锥等）：NMS核大小从更大的3变为 1（不做池化，保留更多候选框） # 特殊处理小目标（行人、交通锥等）
+         # 特殊处理小目标（行人、交通锥等）
+        # 小目标的热图信号较弱且范围小，1x1 核的 NMS 相当于 “不抑制”，避免将唯一的真实中心误删；
         if self.test_cfg["dataset"] == "nuScenes":
             local_max[
                 :,
                 8,
-            ] = F.max_pool2d(heatmap[:, 8], kernel_size=1, stride=1, padding=0)
+            ] = F.max_pool2d(heatmap[:, 8], kernel_size=1, stride=1, padding=0) #nms核为1
             local_max[
                 :,
                 9,
@@ -396,11 +427,32 @@ class TransFusionHead(nn.Module):
                 :,
                 2,
             ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
-        # 只保留热力图中等于局部极大值的位置（过滤非峰值）
+
+
+        
+        # 仅保留热图中等于局部最大值的位置（其他位置置0）
         heatmap = heatmap * (heatmap == local_max)
+        # 只保留热图中 “局部区域内分数最高” 的位置，其他位置全部置 0
+        # 从而过滤冗余候选框  这个过程的不确定性衡量一下
+        # 通过 heatmap = heatmap * (heatmap == local_max) 筛选出 “只有原始热图分数等于局部最高分” 的位置
+
+        # 以上为对热力图进行预处理，包括 sigmoid 激活和局部非极大值抑制 (NMS)，目的是筛选出潜在的目标中心，同时避免相邻位置的重复候选框。
+        
+        # 经过上述步骤后，热图呈现以下特点：
+        
+        # 每个目标中心附近仅保留 1 个最高分数点（无冗余）；
+        # 分数在 [0,1] 区间，便于后续按阈值筛选；
+        # 小目标的真实中心被有效保留，大目标的冗余候选框被抑制。
+        
+        # 热图预处理是 “从稠密分数图中提取有效目标中心” 的关键步骤，
+        #热图生成后，先通过 sigmoid 将原始分数归一化到 [0,1] 区间，再用局部 NMS 提取每个区域的最大值并融入热图以抑制冗余，最后筛选出分数最高的前 K 个位置作为初始候选框。
 
 
 
+
+
+
+        
         #Top-128 候选框筛选的索引计算
         # 展平热力图：[4,10,180,180] → [4,10,32400] → 再合并类别和位置维度 → [4, 324000]（10×32400）
         heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
@@ -408,14 +460,23 @@ class TransFusionHead(nn.Module):
         # top #num_proposals among all classes
         # 3. 选 top-num_proposals 个候选框（跨所有类别选分数最高的）
         #筛选 top-128：按分数降序排序，取前 128 个索引top_proposals: [4,128]；
+
+
+        
         top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
             ..., : self.num_proposals
         ]
+
+
+
+        
         #解析索引（核心！）
         #对每个索引 idx 在 top_proposals 中
         类别：cls = idx // 32400（32400 是单类别位置数）→ 0~9；
         位置：pos = idx % 32400 → 0~32399（对应 BEV 展平序列的索引）。
         例：idx=32405 → cls=32405//32400=1（类别 1），pos=32405%32400=5（第 5 个 BEV 位置）。
+
+        
         top_proposals_class = top_proposals // heatmap.shape[-1]            
         top_proposals_index = top_proposals % heatmap.shape[-1]            
         
@@ -436,15 +497,28 @@ class TransFusionHead(nn.Module):
         #融合类别嵌入：将 cls 转为 one-hot 编码[4,128,10]，经Conv1d(10,128,1)压缩到 128 维，与query_feat相加（补全类别信息）
         #类别嵌入（class_encoding）的融合方式
         #为什么需要：候选框的类别信息（如 “行人” vs “汽车”）会影响后续尺寸 / 旋转角预测（行人更窄，汽车更高），需融入特征。
-        #引入先验知识呢（同归对比 得出不确定性）？？？？？？
+        #引入先验知识呢（同归对比 得出不确定性）？？？？？
+        #One-hot 编码：top_proposals_class: [4,128] → [4,128,10]（第 cls 位为 1，其余 0）
 
-         #One-hot 编码：top_proposals_class: [4,128] → [4,128,10]（第 cls 位为 1，其余 0）
+
+
+        
         one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(
             0, 2, 1
         )
+
+
+
+        
         # 类别嵌入：[B, num_classes, 128] → [B, hidden_channel, 128]（Conv1d 压缩通道）
+
+
+        
         query_cat_encoding = self.class_encoding(one_hot.float())
         query_feat += query_cat_encoding
+
+
+        
 
         选 128 个候选框是 “精度 - 效率平衡点”—— 选太少（如 32 个）易漏检小目标（如交通锥），
         选太多（如 512 个）会增加 Transformer 计算量；
@@ -454,6 +528,9 @@ class TransFusionHead(nn.Module):
 
 
         # 6. 构建候选框位置嵌入（query_pos）：从 BEV 位置嵌入中提取候选框位置
+
+
+        
         query_pos = bev_pos.gather(
             index=top_proposals_index[:, None, :]
             .permute(0, 2, 1)
@@ -482,6 +559,8 @@ class TransFusionHead(nn.Module):
             query_feat = self.decoder[i](
                 query_feat, lidar_feat_flatten, query_pos, bev_pos
             )
+
+
             
             # 解码器层接收  查询  展平的bev特征  查询位置编码  bev位置编码
             # 输入：
@@ -519,6 +598,10 @@ class TransFusionHead(nn.Module):
             #     heatmap：[4,10,128] → 候选框属于每个类别的分数（用于分类损失）。
             #     关键修正：center 是偏移量，需加初始位置得到绝对坐标：
             #     res_layer["center"] = res_layer["center"] + query_pos.permute(0,2,1)（query_pos 转置为 [4,2,128]）。
+
+
+
+
             res_layer = self.prediction_heads[i](query_feat)
              
             res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
@@ -526,12 +609,21 @@ class TransFusionHead(nn.Module):
             ret_dicts.append(res_layer)
 
             # for next level positional embedding# 3. 更新下一层的位置嵌入（用当前层预测的 center 作为下一层的 query_pos，迭代优化）
+
+
             query_pos = res_layer["center"].detach().clone().permute(0, 2, 1)
+
+
+
 
         #################################
         # transformer decoder layer (img feature as K,V)  # 步骤 4：补充预测信息（热力图分数、dense 热力图）
         #################################
          # 候选框的热力图分数（从 dense 热力图中提取）
+
+
+
+
         ret_dicts[0]["query_heatmap_score"] = heatmap.gather(
             index=top_proposals_index[:, None, :].expand(-1, self.num_classes, -1),
             dim=-1,
@@ -543,6 +635,9 @@ class TransFusionHead(nn.Module):
         if self.auxiliary is False:
             # only return the results of last decoder layer
             return [ret_dicts[-1]]# 仅返回最后一层（最优预测）
+
+
+
 
             # 若用辅助监督：拼接所有层的预测（同一参数在 num_proposals 维度拼接）
         # return all the layer's results for auxiliary superivison
@@ -556,12 +651,13 @@ class TransFusionHead(nn.Module):
                 new_res[key] = ret_dicts[0][key]# 保留第一层的特殊键
         return [new_res]
 
+
+
+
+
     1. forward：入口函数
     作用：接收多尺度特征（本代码只支持单尺度），调用 forward_single 处理，返回预测结果。
     def forward(self, feats, metas):
-
-
-        
         """Forward pass.
         Args: #args指的是参数  输入的是特征  以列表形式存储的张量 多尺度特征  “多尺度特征”（如 FPN 输出的不同分辨率特征图），所以用列表包裹多个张量，每个张量对应一个尺度。
             feats (list[torch.Tensor]): Multi-level features, e.g.,
@@ -589,8 +685,16 @@ class TransFusionHead(nn.Module):
         return res  ## res[0] 是 forward_single 的输出（预测结果）
 
 
+
+
+
+
     1. get_targets：生成训练目标（GT 分配给预测）
     作用：批量处理每个样本的 GT 框，调用 get_targets_single 生成每个样本的训练目标（如类别标签、box 回归目标）。
+
+
+
+
     def get_targets(self, gt_bboxes_3d, gt_labels_3d, preds_dict):
         """Generate training targets.
         Args:
