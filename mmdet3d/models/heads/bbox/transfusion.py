@@ -384,8 +384,8 @@ class TransFusionHead(nn.Module):
             list[dict]: Output results for tasks.
         """
 
-        batch_size = inputs.shape[0]  #读取批次大小
-        lidar_feat = self.shared_conv(inputs)   #对特征进行共享卷积操作
+        batch_size = inputs.shape[0]  #读取批次大小  4
+        lidar_feat = self.shared_conv(inputs)   #对特征进行共享卷积操作   4  512  180  180_________4 128 180 180 变化
 
         
         #################################
@@ -399,7 +399,7 @@ class TransFusionHead(nn.Module):
 
         #：将 2D 空间维度（H×W）展平为 1D 序列长度 N=H×W
         
-        lidar_feat_flatten = lidar_feat.view(batch_size, lidar_feat.shape[1], -1)  
+        lidar_feat_flatten = lidar_feat.view(batch_size, lidar_feat.shape[1], -1)    [4,128,180,180] → [4,128,32400]
 
         #作用：view 是 PyTorch 中重塑张量形状的函数（不改变数据顺序，仅改变维度划分），-1 表示 “自动计算该维度大小”。
         # 输入形状：[B, 128, H, W]（如 [4, 128, 180, 180]）；
@@ -413,13 +413,22 @@ class TransFusionHead(nn.Module):
         生成步骤：假设 BEV 网格的物理范围是 [x_min, x_max]×[y_min, y_max]（从 test_cfg["point_cloud_range"] 获取）
         每个网格的物理尺寸为 voxel_size×out_size_factor（如 0.1m×8=0.8m 每网格）
         生成均匀网格坐标：
-        （0.5×grid_size 是网格中心偏移）；展平为序列：[1, 180, 180, 2] → [1, 32400, 2]，再重复到 B=4 → [4, 32400, 2]。
+        （0.5×grid_size 是网格中心偏移）；展平为序列：[1, 180, 180, 2] → [1, 32400, 2]，再重复到 
+       
         
         bev_pos = self.bev_pos.repeat(batch_size, 1, 1).to(lidar_feat.device)
 
-        #repeat(batch_size, 1, 1)：将位置编码复制 B 份，匹配批量大小，输出形状 [B, N, 2]（如 [4, 32400, 2]）；
-        #to(lidar_feat.device)：确保位置编码与 BEV 特征在同一设备（CPU/GPU），避免设备不匹配错误；
-        #目的：为每个 BEV 网格点添加物理空间坐标，让 Transformer 理解 “特征点在鸟瞰图中的位置”，是注意力机制捕捉空间关系的关键。
+                    #self.bev_pos：在模型初始化（__init__）时通过create_2D_grid生成的BEV 网格位置编码，形状为 [1, 32400, 2]。 
+                                #32400表示的是总网格数量
+                                #2：每个网格的 2D 坐标（x/y，对应 BEV 视角下的物理位置）
+                    #repeat(batch_size, 1, 1)：对self.bev_pos进行维度复制，适配输入的批量大小
+            
+                    #repeat(batch_size, 1, 1)：对self.bev_pos进行维度复制，适配输入的批量大小：
+                    # batch_size：输入数据的样本数量（如 4），表示第 0 维（批量维度）复制batch_size次得到[4, 32400, 2]。 
+                    # 后两个1：表示第 1 维（网格数 N）和第 2 维（坐标维度 2）不复制，保持原尺寸
+        
+                    #to(lidar_feat.device)：.to(lidar_feat.device)：将复制后的bev_pos移动到与lidar_feat（BEV 特征张量）相同的计算设备（CPU 或 GPU）
+                    #避免因设备不一致导致的运算错误（PyTorch 要求参与计算的张量必须在同一设备上）
 
         
         #################################
@@ -449,11 +458,11 @@ class TransFusionHead(nn.Module):
 
    
         dense_heatmap = self.heatmap_head(lidar_feat)  ## 5. 生成稠密热力图：预测每个BEV网格点属于各类别的分数（未激活） 得到热力图[4,128,180,180] → [4,10,180,180]
+                    #10对应十个种类  10个通道 每个通道表示一个种类   每个网格表示每个种类的得分
+                
         dense_heatmap_img = None ## 预留参数（图像辅助热力图，暂未用）
 
-        #输入形状：[B, 128, H, W]；
-        # 输出形状：[B, num_classes, H, W]（如 [4, 10, 180, 180]，10 = 类别数）；
-        # 目的：热力图的每个通道对应一个类别，每个网格的数值表示 “该网格是该类目标中心的分数”，用于初步定位目标。
+       
 
 
         
@@ -464,7 +473,7 @@ class TransFusionHead(nn.Module):
         local_max = torch.zeros_like(heatmap)               # 创建一个与原始热图形状、属性完全一致的零张量，用于后续存储 “局部最大值” 结果    创建局部最大值存储张量（初始全0）
          
         #所有元素初始为 0。
-        #         torch.zeros_like(input) 是 PyTorch 中的一个张量创建函数，作用是：
+        #torch.zeros_like(input) 是 PyTorch 中的一个张量创建函数，作用是
         # 生成一个新张量，其形状（shape）、数据类型（dtype）、设备（device，如 CPU/GPU） 与输入张量（这里是heatmap）完全一致
 
         
