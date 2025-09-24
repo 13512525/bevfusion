@@ -1,3 +1,14 @@
+# LiDAR BEV 特征输入  
+# → 特征预处理（共享卷积+展平）  
+# → 热图生成与峰值筛选（NMS）  
+# → Top-K 候选框筛选（类别+位置索引解析）  
+# → 候选框特征准备（语义+类别嵌入+位置）  
+# → 多层 Transformer 解码（迭代优化特征）  
+# → 预测头生成目标参数（中心/尺寸/旋转角/类别）  
+# → 训练：损失计算（热图+分类+回归）→ 反向优化  
+# → 推理：参数解码+NMS → 最终 3D 检测结果
+
+
 import copy
 
 import numpy as np
@@ -35,7 +46,7 @@ def clip_sigmoid(x, eps=1e-4):
 
 @HEADS.register_module()
 class TransFusionHead(nn.Module):
-    def __init__(
+    def __init__( #接收配置文件中传递的一些参数
         self,
         num_proposals=128,
         auxiliary=True,
@@ -51,7 +62,7 @@ class TransFusionHead(nn.Module):
         bn_momentum=0.1,
         activation="relu",
         # config for FFN
-        common_heads=dict(),
+        common_heads=dict(), #接收配置文件传递的参数 来进行。
         num_heatmap_convs=2,
         conv_cfg=dict(type="Conv1d"),
         norm_cfg=dict(type="BN1d"),
@@ -69,7 +80,7 @@ class TransFusionHead(nn.Module):
         bbox_coder=None,
     ):
         super(TransFusionHead, self).__init__()
-
+        #存储配置文件中传递的参数
         self.fp16_enabled = False
 
         self.num_classes = num_classes
@@ -126,9 +137,10 @@ class TransFusionHead(nn.Module):
                 bias=bias,
             )
         )
-        self.heatmap_head = nn.Sequential(*layers)
+        self.heatmap_head = nn.Sequential(*layers)  #热图头构建
         self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
 
+        #解码器构建
         # transformer decoder layers for object query with LiDAR feature
         self.decoder = nn.ModuleList()
         for i in range(self.num_decoder_layers):
@@ -144,7 +156,7 @@ class TransFusionHead(nn.Module):
                 )
             )
 
-        # Prediction Head
+        # Prediction Head 预测头构建
         self.prediction_heads = nn.ModuleList()
         for i in range(self.num_decoder_layers):
             heads = copy.deepcopy(common_heads)
@@ -163,24 +175,30 @@ class TransFusionHead(nn.Module):
         self._init_assigner_sampler()
 
         # Position Embedding for Cross-Attention, which is re-used during training
-        x_size = self.test_cfg["grid_size"][0] // self.test_cfg["out_size_factor"]
+        x_size = self.test_cfg["grid_size"][0] // self.test_cfg["out_size_factor"]  #计算  1440  1440   除  8  刚到等于180  180  特征图的形状尺寸
         y_size = self.test_cfg["grid_size"][1] // self.test_cfg["out_size_factor"]
-        self.bev_pos = self.create_2D_grid(x_size, y_size)
+        self.bev_pos = self.create_2D_grid(x_size, y_size)  #输入特征图x和y尺寸 180  180    计算位置坐标 编码
 
         self.img_feat_pos = None
         self.img_feat_collapsed_pos = None
 
     def create_2D_grid(self, x_size, y_size):
-        meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
+        meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]  #起始点 重点 网格个数
         # NOTE: modified
         batch_x, batch_y = torch.meshgrid(
-            *[torch.linspace(it[0], it[1], it[2]) for it in meshgrid]
+            *[torch.linspace(it[0], it[1], it[2]) for it in meshgrid] #从上面逐个取出
         )
-        batch_x = batch_x + 0.5
+        
+        #[torch.linspace(it[0], it[1], it[2]) for it in meshgrid]：对 meshgrid 的每个方向生成均匀分布的坐标点。
+        # torch.meshgrid(...)：将 x 和 y 方向的一维坐标组合成二维网格，生成两个x_size x y_size的矩阵：
+        # batch_x：每行都是 x 方向的坐标（横向重复）；
+        # batch_y：每列都是 y 方向的坐标（纵向重复）
+        
+        batch_x = batch_x + 0.5 #加0.5进行偏移
         batch_y = batch_y + 0.5
-        coord_base = torch.cat([batch_x[None], batch_y[None]], dim=0)[None]
-        coord_base = coord_base.view(1, 2, -1).permute(0, 2, 1)
-        return coord_base
+        coord_base = torch.cat([batch_x[None], batch_y[None]], dim=0)[None]    # 拼接x和y坐标，增加批次维度
+        coord_base = coord_base.view(1, 2, -1).permute(0, 2, 1)                # 展平空间维度，调整为[批次, 网格总数, 2]格式
+        return coord_base  #展平空间维度，调整为[批次, 网格总数, 2]格式
 
     def init_weights(self):
         # initialize transformer
@@ -228,22 +246,22 @@ class TransFusionHead(nn.Module):
         #################################
         lidar_feat_flatten = lidar_feat.view(
             batch_size, lidar_feat.shape[1], -1
-        )  # [BS, C, H*W]
-        bev_pos = self.bev_pos.repeat(batch_size, 1, 1).to(lidar_feat.device)
+        )  # [BS, C, H*W]                                                              #生成序列特征
+        bev_pos = self.bev_pos.repeat(batch_size, 1, 1).to(lidar_feat.device)  #调用生成网格坐标  并复制batch_size次   
 
         #################################
         # image guided query initialization
         #################################
-        dense_heatmap = self.heatmap_head(lidar_feat)
+        dense_heatmap = self.heatmap_head(lidar_feat) #利用特征 生成密集热图  4 128 180 180 ————4 10(对应种类） 180  180
         dense_heatmap_img = None
-        heatmap = dense_heatmap.detach().sigmoid()
-        padding = self.nms_kernel_size // 2
-        local_max = torch.zeros_like(heatmap)
+        heatmap = dense_heatmap.detach().sigmoid() #对每个通道（每个种类） 每个网格 采用sigmoid进行激活  
+        padding = self.nms_kernel_size // 2  #nms核
+        local_max = torch.zeros_like(heatmap) #复制一个核热图同shape的全0张量数据
         # equals to nms radius = voxel_size * out_size_factor * kenel_size
         local_max_inner = F.max_pool2d(
             heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0
-        )
-        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner
+        )#提取内部的最大值  通多最大池化  nms卷积核
+        local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner #将内部最大值  放到全0张量中 得到带有卷积后的张量
         ## for Pedestrian & Traffic_cone in nuScenes
         if self.test_cfg["dataset"] == "nuScenes":
             local_max[
@@ -263,80 +281,157 @@ class TransFusionHead(nn.Module):
                 :,
                 2,
             ] = F.max_pool2d(heatmap[:, 2], kernel_size=1, stride=1, padding=0)
-        heatmap = heatmap * (heatmap == local_max)
-        heatmap = heatmap.view(batch_size, heatmap.shape[1], -1)
+        heatmap = heatmap * (heatmap == local_max) #进一步相乘  0乘仍然为0  最大值有数字表示
+        heatmap = heatmap.view(batch_size, heatmap.shape[1], -1) #展平 4 10 32400
 
         # top #num_proposals among all classes
         top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[
             ..., : self.num_proposals
-        ]
-        top_proposals_class = top_proposals // heatmap.shape[-1]
-        top_proposals_index = top_proposals % heatmap.shape[-1]
-        query_feat = lidar_feat_flatten.gather(
-            index=top_proposals_index[:, None, :].expand(
+        ]#展平4 324000  然后对最后一个维度进行降序排列  取出前self.num_proposals个 当作候选框
+        
+        top_proposals_class = top_proposals // heatmap.shape[-1]  #类别信息 通过提案的索引 除热图总数====类别信息  类别是按照通道算的 每个通道32400个 依次排序
+        top_proposals_index = top_proposals % heatmap.shape[-1]  #位置信息  50000%32400=17600 → 类别 1 的第 17600 个位置  但是表达的shape是[4,128]  128个框  都是对应0---324000中的128个内容
+     
+        
+        
+        query_feat = lidar_feat_flatten.gather(  #生成查询特征  
+            index=top_proposals_index[:, None, :].expand(                                              
                 -1, lidar_feat_flatten.shape[1], -1
             ),
             dim=-1,
         )
-        self.query_labels = top_proposals_class
+        # top_proposals_index[:, None, :]——增加中间维度后：[2, 128]——[2, 1, 128]
+        # expand(-1, lidar_feat_flatten.shape[1], -1)   [2, 1, 128]——[2, 128, 128]                  -1是表示不变的内容
+
+
+
+        
+        self.query_labels = top_proposals_class                                 #存储语义标签 提取候选框的语义标签[4,128]  128个数字  0-9对应十个种类
 
         # add category embedding
-        one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(
+        one_hot = F.one_hot(top_proposals_class, num_classes=self.num_classes).permute(         #利用的提议类别索引信息  生成独热编码  
             0, 2, 1
         )
-        query_cat_encoding = self.class_encoding(one_hot.float())
-        query_feat += query_cat_encoding
+        #输入top_proposals_class  [batch_size, num_proposals]如[2, 128]  将这个纯数字 转化为独热编码表示 
+        #输出形状：[batch_size, num_proposals, num_classes]（如[2, 10, 128]），每个位置是一个num_classes维的独热向量。  128行  10列 吗？
+        #示例
+            #top_proposals_class的某一行是 [0, 1, 2]（3 个候选框，分别是车、行人、自行车）
+            #F.one_hot  表示为[
+                                 [1, 0, 0],  # 类别0（车）的独热向量
+                                 [0, 1, 0],  # 类别1（行人）的独热向量
+                                 [0, 0, 1]   # 类别2（自行车）的独热向量
+                                ]
+        #permute(0, 2, 1)：调整维度顺序[2, 10, 128]
+        #“行人（类别 1）”，其独热向量是[0,1,0,...,0]
+
+
+
+
+        query_cat_encoding = self.class_encoding(one_hot.float())                  #输入独热编码 —— 生成分类的高维度数据    [2, 10, 128]——[2, 128, 128]
+        query_feat += query_cat_encoding           #同维度相加                                #将类别信息核特征信息结合
 
         query_pos = bev_pos.gather(
-            index=top_proposals_index[:, None, :]
-            .permute(0, 2, 1)
-            .expand(-1, -1, bev_pos.shape[-1]),
+            index=top_proposals_index[:, None, :]  #同样是[4,128]---[4,1,128]
+            .permute(0, 2, 1)                               [4,1,128]--[4,128,1]
+            .expand(-1, -1, bev_pos.shape[-1]),    #[4,128,1]---[4,128,2]
             dim=1,
-        )
-
+        ) #输出形状为 [batch_size, num_proposals, 2]（如 [4, 128, 2]）
+        #gather 就是 “索引上面的index，从花名册中把这 128 个位置从bev_pos中挑选出来”，最终得到的 query_pos 就是这 128 个的坐标列表。 得到[4, 128, 2]  得到具体的坐标信息
+        
+        将bev_pos和里面的内容 在1维度上进行
+        
+        
+        #从预先生成的 BEV 位置嵌入bev_pos属性为展平空间维度，调整为[批次, 网格总数, 2]格式
+        中，精准提取出 Top-K 候选框对应的空间坐标（x,y），最终生成每个候选框的位置嵌入（query_pos）
+          
         #################################
         # transformer decoder layer (LiDAR feature as K,V)
-        #################################
-        ret_dicts = []
-        for i in range(self.num_decoder_layers):
-            prefix = "last_" if (i == self.num_decoder_layers - 1) else f"{i}head_"
+        # 通过多层 Transformer 解码器对候选框特征（query_feat）进行迭代优化
+        # 结合特征（作为注意力的 Key 和 Value）生成越来越精确的目标预测结果（如中心坐标、尺寸等）
+        # 并最终返回预测结果用于损失计算或推理
+        # 代码分为三个核心部分：
+        # LiDAR 特征作为 K/V 的 Transformer 解码器迭代优化：通过多层解码器，利用 LiDAR 的 BEV 特征优化候选框特征；
+        # 预测头（Prediction Head）生成具体预测结果：每层解码器输出后，通过预测头生成边界框、类别等具体预测；
+        # 结果处理与返回：根据是否需要辅助监督（auxiliary），返回最后一层结果或所有层结果
+        # #################################
+        
+        ret_dicts = []   #是 “return” 的缩写 存储返回结果的列表  ret_dicts即 “要返回的字典列表”，用于存储每一层解码器输出的预测结果（每个结果是一个字典）
+        
+        for i in range(self.num_decoder_layers):  #逐个遍历解码器层： 多层迭代优化
+            prefix = "last_" if (i == self.num_decoder_layers - 1) else f"{i}head_"   
 
             # Transformer Decoder Layer
             # :param query: B C Pq    :param query_pos: B Pq 3/6
-            query_feat = self.decoder[i](
+            query_feat = self.decoder[i](                              #第 i 层 Transformer 解码器（包含自注意力和交叉注意力模块）
                 query_feat, lidar_feat_flatten, query_pos, bev_pos
             )
+            #输入参数：查询特征[4, 128, 128] ：形状[4, 128, 128]（4 个样本，128 维特征，128 个候选框），作为注意力的 “查询（Query）”
+                       特征序列[4 128 32400]：展平的 LiDAR BEV 特征，形状[4, 128, 32400]（4 个样本，128 维特征，32400 个 BEV 网格位置），作为注意力的 “键（Key）” 和 “值（Value）”—— 代表 “全局场景信息”
+                      #查询位置[4, 128, 2] 形状[4, 128, 2]（4 个样本，128 个候选框，每个候选框的 (x,y) 坐标）—— 告诉模型 “候选框当前在哪里”
+                      #bev_pos所有 BEV 网格的位置嵌入，形状[4, 32400, 2]（4 个样本，32400 个网格，每个网格的 (x,y) 坐标）—— 辅助模型理解 “全局空间位置”。
+            解码器的核心作用：
+                        #自注意力（Self-Attention）：让 128 个候选框之间相互 “关注”（例如：“候选框 A 和候选框 B 距离很近，可能是同一类目标”），学习候选框间的关系
+                        #交叉注意力（Cross-Attention）：让每个候选框 “聚焦” 到 LiDAR 特征中与自己相关的区域（例如：“车的候选框重点关注 BEV 中对应位置的点云密集区”），从全局特征中吸收细节信息。
+            
+            #输出：优化后的query_feat（仍为[4, 128, 128]），但比输入更 “精准”—— 包含了更多全局上下文和候选框关系信息。
 
-            # Prediction
-            res_layer = self.prediction_heads[i](query_feat)
+
+            
+            # Prediction————从特征到具体目标参数
+            res_layer = self.prediction_heads[i](query_feat)   
+                                #字典类型，存储该层的预测结果，包含的关键键值对（结合维度）
+                                    #预测结果：center  size    heading   cls_score   四个内容 详细看预测头的内容
+                                #self.prediction_heads[i]：第 i 层解码器对应的预测头（由卷积层组成的小型网络），
+                                #作用是将抽象的query_feat（128 维特征）转换为具体的 3D 目标参数。       
+                                #res_layer——字典类型 通过键访问内容
             res_layer["center"] = res_layer["center"] + query_pos.permute(0, 2, 1)
-            first_res_layer = res_layer
-            ret_dicts.append(res_layer)
+                                #计算绝对中心坐标
+                                #query_pos.permute(0, 2, 1)：将query_pos的形状从[4, 128, 2]（样本数，候选框数，x/y）调整为[4, 2, 128]（样本数，x/y, 候选框数）
+                                #与res_layer["center"]的维度（[4, 2, 128]）匹配，确保能逐元素相加。
+            
+            first_res_layer = res_layer  ## 临时保存第一层结果（预留，当前未使用）
+            
+            ret_dicts.append(res_layer)  # # 将当前层结果存入ret_dicts，最终ret_dicts会有多个元素（对应预测头和解码器层的层数）
 
             # for next level positional embedding
+            # 更新下一层的位置嵌入 
+                    #res_layer["center"].permute(0, 2, 1)：将绝对中心坐标的形状从[4, 2, 128]调整回[4, 128, 2]
+                    #clone()：复制张量，避免后续修改影响原始的res_layer["center"]；
+                    #detach()：切断该张量与计算图的连接，确保位置嵌入的更新不会影响之前层的参数训练（仅用预测结果作为下一层的输入，不参与反向传播）。
+
+            #作用：用当前层预测的 “更精准的中心坐标” 作为下一层的初始位置嵌入，实现 “迭代优化”—— 每一层都站在上一层的肩膀上进一步微调，逐步逼近真实目标位置。
+                #更新查询位置嵌入  使用优化迭代过的进行输入下一个编码器层中 逐层迭代
             query_pos = res_layer["center"].detach().clone().permute(0, 2, 1)
 
         #################################
         # transformer decoder layer (img feature as K,V)
+        #补充热图相关信息
         #################################
         ret_dicts[0]["query_heatmap_score"] = heatmap.gather(
             index=top_proposals_index[:, None, :].expand(-1, self.num_classes, -1),
             dim=-1,
-        )  # [bs, num_classes, num_proposals]
-        ret_dicts[0]["dense_heatmap"] = dense_heatmap
+        )                                               # 形状[4, 10, 128]（4个样本，10个类别，128个候选框）
+        ret_dicts[0]["dense_heatmap"] = dense_heatmap  
+                        #dense_heatmap：原始的稠密热图（未筛选的所有 32400 个位置的分数），存入ret_dicts[0]用于：
+                                # 可视化（查看热图分布是否合理）；
+                                # 辅助监督（如计算热图回归损失，优化热图生成质量）
 
-        if self.auxiliary is False:
+        if self.auxiliary is False: #结果返回逻辑：根据模式返回不同结果
+                                    #推理阶段（auxiliary=False）：只返回最后一层的结果（ret_dicts[-1]），因为经过 6 层迭代后，最后一层的预测最精准
             # only return the results of last decoder layer
-            return [ret_dicts[-1]]
+            return [ret_dicts[-1]]  #如果false  讲列表中记录的结果的最后一层返回为最终结果。
 
-        # return all the layer's results for auxiliary superivison
+        # return all the layer's results for auxiliary superivison #
+        ## 辅助监督模式（训练时）：返回所有层的结果
         new_res = {}
         for key in ret_dicts[0].keys():
             if key not in ["dense_heatmap", "dense_heatmap_old", "query_heatmap_score"]:
+                 # 拼接所有层的预测参数（如center、size等）
                 new_res[key] = torch.cat(
                     [ret_dict[key] for ret_dict in ret_dicts], dim=-1
                 )
             else:
+                # 热图相关键只保留第一层的结果（与层数无关）
                 new_res[key] = ret_dicts[0][key]
         return [new_res]
 
